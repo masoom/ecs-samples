@@ -24,25 +24,6 @@ To Destroy Resources:
 Refer Cloudformation template in /Cloudformation
 
 
-#### API:
+#### blue-green deploy:
 
-Check src/app/py
-
-Send a Post Request to endpoint `/api/copyright`
-
-Example JSON Body:
-
-`{
-     "input": "Consulting offers a range of mult-cloud projects with clients in banking using Google Cloud."
- }
-`
-
-Response:
-
-
-`{
-     "Consulting offers a range of mult-cloud projects with clients in banking using Google© Cloud."
- }
-`
-
-
+Refer the ecs-deploy.sh script
