@@ -1,14 +1,7 @@
 #### README
 
-Python Flask based API Deployed on AWS ECS Fargate and provisioned using Terraform or Cloudformation.
-
-
-#### Docker Image 
-Docker Image URI : `public.ecr.aws/i5k1d4j1/deloitte-copyright-api:1.0`
-
-Pull Docker Image to test 
-
-`docker pull public.ecr.aws/i5k1d4j1/deloitte-copyright-api:1.0`
+Sample Terraform Module & Plan for ECS Fargate
+Reference https://github.com/terraform-aws-modules/terraform-aws-ecs
 
 Terraform Module & Plan: 
 Refer /Terraform/tf-module and /Terraform/tf-plan
