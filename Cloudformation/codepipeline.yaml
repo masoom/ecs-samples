@@ -1,0 +1,301 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Codepipeline to build and deploy CopyrightAPI on AWS ECS Fargate
+
+Parameters:
+
+  RepoName:
+    Type: String
+    Default: company-copyrightapi
+    Description: Name of the codecommit repo
+
+  CodeBuildEnvironment:
+    Type: String
+    Default: "aws/codebuild/standard:2.0"
+    Description: Docker image to use for CodeBuild container - Use http://amzn.to/2mjCI91 for reference
+
+  StackName:
+    Type: String
+    Default: "copyrightapi-ecs-fargate"
+    Description: Name of the Cloudformation stack to create/update
+
+  CodeRepositoryName:
+    Type: String
+    Default: "copyrightapi"
+    Description: ARN of the copyrightapi code repository
+
+  ECRRepoName:
+    Description: ECR repo that contains the Docker Image for the copyrightapi Task
+    Default: 'copyright-api'
+    Type: String
+
+  SubnetIdAZ1:
+    Description: SubnetId of availability zone 1
+    Default: '/company/landing-zone/vpc/public-subnet-1-id'
+    Type: 'AWS::SSM::Parameter::Value<String>'
+
+  SubnetIdAZ2:
+    Description: SubnetId of availability zone 2
+    Default: '/company/landing-zone/vpc/public-subnet-2-id'
+    Type: 'AWS::SSM::Parameter::Value<String>'
+
+
+  VpcId:
+    Description: Id of the VPC
+    Default: /company/landing-zone/vpc/vpc-id
+    Type: 'AWS::SSM::Parameter::Value<String>'
+
+Resources:
+
+  GrafanaRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+            {
+              "rulePriority": 1,
+              "description": "Only keep 5 images",
+              "selection": {
+                "tagStatus": "any",
+                "countType": "imageCountMoreThan",
+                "countNumber": 5
+              },
+              "action": { "type": "expire" }
+            }]
+          }
+      RepositoryName: !Ref ECRRepoName
+
+  BuildArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+
+  BuildArtifactsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BuildArtifactsBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: EnforceHTTPS
+            Action: 's3:*'
+            Effect: Deny
+            Principal: '*'
+            Resource: !Sub 'arn:aws:s3:::${BuildArtifactsBucket}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: '/managed/'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Action: 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+      Policies:
+        -
+          PolicyName: CodeBuildAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              -
+                Sid: "CodeBuildToCWL"
+                Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/company-copyrightapi-build'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/company-copyrightapi-build:*'
+              -
+                Sid: "CodeBuildToS3ArtifactRepo"
+                Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:PutObject'
+                Resource: !Sub 'arn:aws:s3:::${BuildArtifactsBucket}/*'
+              - Sid: CodePipelineSecretManagerAccess
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:copyrightapi/*'
+              - Sid: CodePipelineSSMParameterAccess
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/copyrightapi/*'
+              - Sid: AllowDescribeSecurityGroups
+                Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeDhcpOptions
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeVpcs
+                  - ec2:CreateNetworkInterfacePermission
+                Resource: '*'
+              - Sid: AllowECS
+                Effect: Allow
+                Action:
+                  - ecs:ListServices
+                  - ecs:DescribeTaskDefinition
+                  - ecs:RegisterTaskDefinition
+                  - ecs:UpdateService
+                Resource: '*'
+              - Action: 'iam:PassRole'
+                Effect: Allow
+                Resource: '*'
+
+  PipelineExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: '/managed/'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/PowerUserAccess
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action: 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+                - cloudformation.amazonaws.com
+      Policies:
+        - PolicyName: CodePipelinePassRoleAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action: 'iam:PassRole'
+                Effect: Allow
+                Resource: '*'
+        - PolicyName: CodePipelineS3ArtifactAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:GetBucketVersioning'
+                  - 's3:PutObject'
+                Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:s3:::${BuildArtifactsBucket}'
+                  - !Sub 'arn:aws:s3:::${BuildArtifactsBucket}/*'
+        - PolicyName: CodePipelineGitRepoAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - 'codecommit:GetBranch'
+                  - 'codecommit:GetCommit'
+                  - 'codecommit:UploadArchive'
+                  - 'codecommit:GetUploadArchiveStatus'
+                  - 'codecommit:CancelUploadArchive'
+                Effect: Allow
+                Resource: !Sub 'arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${CodeRepositoryName}'
+
+        - PolicyName: CodePipelineBuildAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - 'codebuild:StartBuild'
+                  - 'codebuild:StopBuild'
+                  - 'codebuild:BatchGetBuilds'
+                Effect: Allow
+                Resource: !GetAtt CodeBuildProject.Arn
+
+  CodeBuildSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for codebuild
+      GroupName: company-copyrightapi-codebuild
+      SecurityGroupEgress:
+        - Description: outgoing https
+          CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+      VpcId: !Ref VpcId
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: 'company-copyrightapi-build'
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: !Sub '${CodeBuildEnvironment}'
+        PrivilegedMode: true
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Source:
+        Type: CODEPIPELINE
+      TimeoutInMinutes: 60
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref CodeBuildSecurityGroup
+        Subnets:
+          - !Ref SubnetIdAZ1
+          - !Ref SubnetIdAZ2
+          - !Ref SubnetIdAZ3
+        VpcId: !Ref VpcId
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      ArtifactStore:
+        Location: !Ref BuildArtifactsBucket
+        Type: S3
+      Name: 'company-copyrightapi-build'
+      RoleArn: !GetAtt PipelineExecutionRole.Arn
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: CodeCommitRepo
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: "1"
+              Configuration:
+                RepositoryName: 'company-copyrightapi'
+                BranchName: master
+              OutputArtifacts:
+                - Name: SourceZip
+              RunOrder: 1
+        - Name: Build
+          Actions:
+            - Name: CodeBuild
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              InputArtifacts:
+                - Name: SourceZip
+              OutputArtifacts:
+                - Name: BuiltZip

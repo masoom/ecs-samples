@@ -1,0 +1,251 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: ECS Fargate Copyright API Cloudformation Template
+Parameters:
+  VpcId:
+    Description: Gets the VPC ID from SSM Parameter store
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::VPC::Id>
+    Default: /deloitte/landing-zone/vpc/vpc-id
+
+  PublicSubnetAZ1:
+    Description: PublicSubnet of availability zone 1
+    Default: '/deloitte/landing-zone/vpc/public-subnet-1-id'
+    Type: 'AWS::SSM::Parameter::Value<String>'
+
+  PublicSubnetAZ2:
+    Description: PublicSubnet of availability zone 2
+    Default: '/deloitte/landing-zone/vpc/public-subnet-2-id'
+    Type: 'AWS::SSM::Parameter::Value<String>'
+
+  ECRRepoName:
+    Description: ECR repo that contains the Docker Image for the copyrightapi Task
+    Default: 'deloitte-copyrightapi'
+    Type: String
+
+  CopyrightImageName:
+    Description: Docker Image Name for copyrightapi
+    Default: 'copyrightapi:latest'
+    Type: String
+
+  ALBCertificateARN:
+    Description: SSL certificate for ALB
+    Default: 'arn:aws:acm:eu-west-1:088501233127:certificate/bf2c348d-8ac4-42c0-b071-6b8eea8b755e'
+    Type: String
+
+  AlarmSNStopicARN:
+    Description: The ARN of the SNS topic to send alarms to
+    Default: '/cloudwatch/alarms/sns-topic-arn'
+    Type: 'AWS::SSM::Parameter::Value<String>'
+
+# Fetch WebACL ID for Waf FROm System Manager (SSM Parameter Store)
+  WebACLId:
+    Description: The Web ACL ID in eu-west-1
+    Default: '/deloitte/waf/eu-west-1/webacl-id'
+    Type: 'AWS::SSM::Parameter::Value<String>'
+
+Resources:
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+
+  CopyrightClusterNameSSM:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: '/copyrightapi/cluster-name'
+      Type: String
+      Value: !Ref ECSCluster
+      Description: "Cluster name of Copyright API"
+
+  CopyrightServiceNameSSMParameter:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: '/copyrightapi/service-name'
+      Type: String
+      Value: !GetAtt CopyrightService.Name
+      Description: "Copyright API ECS Service Name"
+
+  CopyrightTaskNameSSM:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: '/copyrightapi/task-name'
+      Type: String
+      Value: !Join ['', [!Ref 'AWS::StackName', -copyrightapi]]
+      Description: "Task name of Copyright API"
+
+  EcsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: 'deloitte-copyrightapi-ecs-fargate'
+      GroupDescription: ECS Security Group
+      VpcId: !Ref 'VpcId'
+
+  EcsSecurityGroupHTTPinbound:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref 'EcsSecurityGroup'
+      IpProtocol: tcp
+      FromPort: 3000
+      ToPort: 3000
+      CidrIp: 0.0.0.0/0
+
+  CloudwatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['-', [ECSLogGroup, !Ref 'AWS::StackName']]
+      RetentionInDays: 14
+
+  CopyrightTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Join ['', [!Ref 'AWS::StackName', -copyrightapi]]
+      RequiresCompatibilities:
+        - "FARGATE"
+      Cpu: 256
+      Memory: '512'
+      NetworkMode: awsvpc
+      ContainerDefinitions:
+        - Name: copyrightapi
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.eu-west-1.amazonaws.com/${CopyrightImageName}"
+          Memory: 512
+          Cpu: 256
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref 'CloudwatchLogsGroup'
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: copyrightapi
+          PortMappings:
+            - ContainerPort: 3000
+      TaskRoleArn: !Ref taskExecRole
+      ExecutionRoleArn: !Ref taskExecRole
+
+  CopyrightService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref 'ECSCluster'
+      DeploymentController:
+        Type: ECS
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      DesiredCount: '2'
+      HealthCheckGracePeriodSeconds: 60
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !Ref EcsSecurityGroup
+          Subnets:
+            - !Ref PublicSubnetAZ1
+            - !Ref PublicSubnetAZ2
+      TaskDefinition: !Ref CopyrightTaskDefinition
+      LoadBalancers:
+        - ContainerName: copyrightapi
+          ContainerPort: 3000
+          TargetGroupArn: !Ref 'ECSTargetGroup'
+
+  taskExecRole:
+    Type: AWS::IAM::Role
+    Properties:
+      PermissionsBoundary: !Sub arn:aws:iam::${AWS::AccountId}:policy/masoom-permissions-boundary
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ecs-tasks.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      Path: /
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+
+  CopyrightALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for the Copyright API ALB
+      GroupName: 'deloitte-copyrightapi-ecs-alb'
+      SecurityGroupIngress:
+        -  Description: Allow HTTP traffic from anywhere
+           CidrIp: "0.0.0.0/0"
+           IpProtocol: tcp
+           FromPort: 443
+           ToPort: 443
+      VpcId: !Ref VpcId
+
+  CopyrightALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: deloitte-copyrightapi
+      Scheme: internal
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '600'
+        - Key: access_logs.s3.enabled
+          Value: true
+      Subnets:
+        - !Ref PublicSubnetAZ1
+        - !Ref PublicSubnetAZ2
+      SecurityGroups: [!Ref 'CopyrightALBSecurityGroup']
+
+  CopyrightALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn: taskExecRole
+    Properties:
+      Certificates:
+        - CertificateArn: !Ref ALBCertificateARN
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ECSTargetGroup
+      LoadBalancerArn: !Ref CopyrightALB
+      Port: '443'
+      Protocol: HTTPS
+      SslPolicy: "ELBSecurityPolicy-FS-1-2-Res-2019-08"
+      Certificates:
+        - CertificateArn: !Ref ALBCertificateARN
+
+  ECSTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: CopyrightALB
+    Properties:
+      HealthCheckIntervalSeconds: 80
+      HealthCheckPath: /api/health
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Port: 3000
+      Protocol: HTTP
+      UnhealthyThresholdCount: 5
+      VpcId: !Ref 'VpcId'
+      TargetType: 'ip'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '60'
+
+# Using WAF WebACL Rules to protect Application Load Balancer
+  CopyrightWAFAssociation:
+    Type: AWS::WAFRegional::WebACLAssociation
+    Properties:
+      ResourceArn: !Ref CopyrightALB
+
+  CopyrightUnHealthyTargetsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      ActionsEnabled: true
+      AlarmDescription: Alert when Copyright API HealthyHostCount < 2
+      Namespace: AWS/ApplicationELB
+      MetricName: HealthyHostCount
+      Dimensions:
+        - Name: TargetGroup
+          Value: !GetAtt ECSTargetGroup.TargetGroupFullName
+        - Name: LoadBalancer
+          Value: !GetAtt CopyrightALB.LoadBalancerFullName
+      Statistic: Average
+      ComparisonOperator: LessThanThreshold
+      Threshold: 2
+      DatapointsToAlarm: 1
+      EvaluationPeriods: 1
+      Period: 300 #5 minutes
+      AlarmActions:
+        - !Ref AlarmSNStopicARN
+      OKActions:
+        - !Ref AlarmSNStopicARN
+      TreatMissingData: missing
